@@ -1,24 +1,39 @@
 """Conversational AI Assistant Layer.
 
 Coordinates intent classification, ChromaDB semantic product search,
-order tracking via OrderClient, conversation memory, and response generation
-supporting both LLM-powered (OpenAI-compatible) and deterministic fallback modes.
+order tracking via OrderClient, conversation memory, and response generation.
+Supports Google Gemini, OpenAI-compatible APIs, and reliable deterministic fallbacks.
 """
 
 import os
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
-from intent_router import IntentResult, IntentRouter
+from intent_router import (
+    INTENT_GREETING,
+    INTENT_PRODUCT_SEARCH,
+    INTENT_PRODUCT_COMPARISON,
+    INTENT_ORDER_TRACKING,
+    INTENT_FOLLOW_UP,
+    INTENT_GENERAL_QUESTION,
+    IntentResult,
+    IntentRouter,
+)
 from memory import ConversationMemory
 from order_client import OrderClient, default_order_client
 from product_search import ProductSearchEngine, get_search_engine
 
 load_dotenv()
 
+# Fallback model list for Gemini if the default experiences spikes or is unavailable
+GEMINI_MODELS_PREFERENCE = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.8-flash"]
+
 
 class ShoppingAssistant:
-    """End-to-end shopping assistant coordinator."""
+    """End-to-end shopping assistant coordinator with separated intent detection,
+
+    tool execution, and response synthesis.
+    """
 
     def __init__(
         self,
@@ -29,28 +44,27 @@ class ShoppingAssistant:
         self.memory = memory or ConversationMemory()
         self.search_engine = search_engine or get_search_engine()
         self.order_client = order_client or default_order_client
-        self.router = IntentRouter()
 
-        # Optional Gemini and OpenAI configurations
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.gemini_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash").strip()
+        # API Keys & Configurations
+        self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        self.gemini_model_name = (os.getenv("GEMINI_MODEL_NAME") or "gemini-3.5-flash").strip()
 
-        self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-        self.openai_model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip()
+        self.openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        self.openai_base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
+        self.openai_model_name = (os.getenv("OPENAI_MODEL_NAME") or "gpt-4o-mini").strip()
 
         self.engine_type = "deterministic"
         self._gemini_client = None
         self._openai_client = None
 
-        # Prioritize Gemini if GEMINI_API_KEY is provided
+        # Initialize LLM Clients
         if self.gemini_api_key:
             try:
                 from google import genai
                 self._gemini_client = genai.Client(api_key=self.gemini_api_key)
                 self.engine_type = "gemini"
             except Exception as e:
-                print(f"Warning: Could not initialize Google Gemini client: {e}. Falling back to deterministic mode.")
+                print(f"Warning: Could not initialize Google Gemini client: {e}")
                 self._gemini_client = None
         elif self.openai_api_key:
             try:
@@ -61,12 +75,17 @@ class ShoppingAssistant:
                 self._openai_client = OpenAI(**kwargs)
                 self.engine_type = "openai"
             except Exception as e:
-                print(f"Warning: Could not initialize OpenAI client: {e}. Falling back to deterministic mode.")
+                print(f"Warning: Could not initialize OpenAI client: {e}")
                 self._openai_client = None
+
+        # Router can use LLM client for structured intent classification
+        active_llm = self._gemini_client or self._openai_client
+        active_model = self.gemini_model_name if self._gemini_client else self.openai_model_name
+        self.router = IntentRouter(llm_client=active_llm, model_name=active_model)
 
     @property
     def is_llm_enabled(self) -> bool:
-        """Return True if an external LLM (Gemini or OpenAI) is configured and ready."""
+        """Return True if an external LLM (Gemini or OpenAI) is active."""
         return self._gemini_client is not None or self._openai_client is not None
 
     @property
@@ -79,65 +98,140 @@ class ShoppingAssistant:
         return "Deterministic Engine (Offline Ready)"
 
     def process_message(self, user_query: str) -> Dict[str, Any]:
-        """Process incoming user message through routing, retrieval, and generation."""
+        """Orchestrate the complete request flow:
+
+        USER MESSAGE
+        → READ RELEVANT CONTEXT
+        → CLASSIFY INTENT
+        → VALIDATE CLASSIFICATION
+        → EXECUTE ONLY REQUIRED TOOL
+        → PASS VERIFIED RESULTS TO GEMINI
+        → GENERATE FINAL RESPONSE
+        → UPDATE CONVERSATION MEMORY
+        → RETURN STRUCTURED RESULT
+        """
         clean_text = (user_query or "").strip()
         if not clean_text:
             return {
                 "response_text": "Please ask a question about products or provide an order ID to track.",
-                "intent": "clarification",
+                "intent": INTENT_GENERAL_QUESTION,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
             }
 
-        # 1. Intent routing
+        # 1. Read context and classify intent
+        context = self.memory.context
         routing_result: IntentResult = self.router.route(
             query=clean_text,
-            conversation_context=self.memory.context,
+            conversation_context=context,
         )
 
-        # Record user query in memory
+        # 2. Record user query in memory
         self.memory.add_user_message(clean_text)
 
-        # 2. Dispatch to intent handler
-        if routing_result.intent == "order_tracking":
+        # 3. Execute ONLY the required tool and synthesize response
+        intent = routing_result.intent
+
+        if intent == INTENT_GREETING:
+            result = self._handle_greeting(routing_result)
+        elif intent == INTENT_GENERAL_QUESTION:
+            result = self._handle_general_question(routing_result)
+        elif intent == INTENT_ORDER_TRACKING:
             result = self._handle_order_tracking(routing_result)
-        elif routing_result.intent == "product_comparison":
+        elif intent == INTENT_PRODUCT_COMPARISON:
             result = self._handle_product_comparison(routing_result)
-        elif routing_result.intent == "follow_up":
+        elif intent == INTENT_FOLLOW_UP:
             result = self._handle_follow_up(routing_result)
-        elif routing_result.intent == "greeting_help":
-            result = self._handle_greeting_help(routing_result)
         else:
             result = self._handle_product_search(routing_result)
 
-        # 3. Record assistant response in memory
+        # 4. Update memory with results from THIS turn
         self.memory.add_assistant_message(
             content=result["response_text"],
-            products=result.get("products"),
+            products=result.get("products") or None,
             order=result.get("order"),
-            metadata={"intent": result.get("intent"), "mode": result.get("mode")},
+            metadata={"intent": intent, "mode": result.get("mode")},
         )
 
         return result
 
+    def _handle_greeting(self, routing: IntentResult) -> Dict[str, Any]:
+        """Handle greetings and pleasantries WITHOUT executing product search."""
+        fallback_text = (
+            "Hello! I am ShopMate, your AI shopping assistant. How can I help you today? "
+            "You can ask me to find products, compare items, check prices, or track an order!"
+        )
+
+        response_text = fallback_text
+        if self.is_llm_enabled:
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate, a friendly, professional AI e-commerce assistant. "
+                    "Respond warmly to the user's greeting or pleasantry. "
+                    "Keep your response natural, friendly, and concise (1-2 sentences). "
+                    "DO NOT mention or list any products unless the user asks for shopping help."
+                ),
+                user_message=routing.raw_query,
+            )
+            if llm_text:
+                response_text = llm_text
+
+        return {
+            "response_text": response_text,
+            "intent": INTENT_GREETING,
+            "products": [],  # Crucial: NO product cards rendered
+            "order": None,
+            "mode": "llm" if self.is_llm_enabled else "deterministic",
+        }
+
+    def _handle_general_question(self, routing: IntentResult) -> Dict[str, Any]:
+        """Handle general inquiries, capabilities, or store questions WITHOUT product retrieval."""
+        fallback_text = (
+            "I am your AI Shopping Assistant! I can help you search our catalog for electronics, "
+            "audio products, accessories, cameras, wearables, and home appliances. "
+            "I can also compare product specifications and track orders using order IDs like ORD1001."
+        )
+
+        response_text = fallback_text
+        if self.is_llm_enabled:
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate, a helpful e-commerce shopping assistant. "
+                    "Answer the user's question politely and concisely. "
+                    "Explain that you help customers find products, compare prices/ratings in Indian Rupees (₹), "
+                    "and track orders. DO NOT invent specific catalog products."
+                ),
+                user_message=routing.raw_query,
+            )
+            if llm_text:
+                response_text = llm_text
+
+        return {
+            "response_text": response_text,
+            "intent": INTENT_GENERAL_QUESTION,
+            "products": [],
+            "order": None,
+            "mode": "llm" if self.is_llm_enabled else "deterministic",
+        }
+
     def _handle_order_tracking(self, routing: IntentResult) -> Dict[str, Any]:
-        """Handle order tracking queries."""
+        """Retrieve order data from OrderClient and format verified status."""
         order_id = routing.order_id
 
         if not order_id:
             msg = (
-                "To track your order, please provide your order ID (for example: **ORD1001**, **ORD1002**, or **ORD1003**)."
+                "To track your order, please provide your Order ID (for example: **ORD1001**, **ORD1002**, or **ORD1003**)."
             )
             return {
                 "response_text": msg,
-                "intent": "order_tracking",
+                "intent": INTENT_ORDER_TRACKING,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
             }
 
-        # Query order client (live API with fallback)
+        # Tool execution: Order API lookup
         res = self.order_client.get_order(order_id)
 
         if not res["success"]:
@@ -154,7 +248,7 @@ class ShoppingAssistant:
             )
             return {
                 "response_text": msg,
-                "intent": "order_tracking",
+                "intent": INTENT_ORDER_TRACKING,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
@@ -164,8 +258,7 @@ class ShoppingAssistant:
         shipping = order.get("shipping_info", {})
         source_label = "Live API Service" if res["source"] == "live_api" else "Local Mock Fallback"
 
-        # Deterministic formatting
-        response_text = (
+        deterministic_text = (
             f"📦 **Order Status for #{order['order_id']}**\n\n"
             f"- **Product:** {order['product_name']}\n"
             f"- **Status:** **{order['order_status']}**\n"
@@ -178,37 +271,40 @@ class ShoppingAssistant:
             f"*(Source: {source_label})*"
         )
 
-        # If LLM enabled, we can let LLM summarize grounded strictly on this order
+        response_text = deterministic_text
         if self.is_llm_enabled:
-            llm_text = self._generate_llm_response(
-                user_query=routing.raw_query,
-                context_type="order",
-                data_summary=f"ORDER DATA: {order}. Source: {source_label}. DO NOT INVENT TRACKING UPDATES.",
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate AI assistant. Explain the order tracking status using ONLY the verified facts below.\n"
+                    "CRITICAL GROUNDING: Do NOT invent delivery updates, locations, or dates.\n"
+                    f"ORDER DATA: {order}\nSource: {source_label}"
+                ),
+                user_message=routing.raw_query,
             )
             if llm_text:
                 response_text = llm_text
 
         return {
             "response_text": response_text,
-            "intent": "order_tracking",
+            "intent": INTENT_ORDER_TRACKING,
             "products": [],
             "order": order,
             "mode": "llm" if self.is_llm_enabled else "deterministic",
         }
 
     def _handle_product_comparison(self, routing: IntentResult) -> Dict[str, Any]:
-        """Compare previously recommended products."""
+        """Compare previously recommended products from conversation memory."""
         previous_products = self.memory.get_last_recommended_products()
 
         if not previous_products:
             msg = (
-                "I don't have any previously recommended products in this conversation to compare yet.\n\n"
+                "I don't have any previously recommended products in our current conversation to compare yet.\n\n"
                 "Try searching for some items first (e.g. *'Show me wireless headphones under ₹3000'*), "
-                "and I'll gladly compare their ratings, prices, and features for you!"
+                "and I'll gladly compare their ratings, prices, and features!"
             )
             return {
                 "response_text": msg,
-                "intent": "product_comparison",
+                "intent": INTENT_PRODUCT_COMPARISON,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
@@ -220,12 +316,12 @@ class ShoppingAssistant:
             best = max(previous_products, key=lambda p: float(p.get("rating", 0)))
             text = (
                 f"⭐ **Highest Rated Product:**\n\n"
-                f"Among the items we discussed, **{best['name']}** has the highest customer rating with **{best['rating']} ★**!\n\n"
+                f"Among the items we discussed, **{best['name']}** has the highest rating with **{best['rating']} ★**!\n\n"
                 f"- **Brand:** {best['brand']}\n"
                 f"- **Price:** ₹{float(best['price']):,.2f}\n"
                 f"- **Category:** {best['category'].title()}\n"
-                f"- **Key Highlight:** {best['description']}\n\n"
-                f"**All Compared Ratings:**\n"
+                f"- **Highlight:** {best['description']}\n\n"
+                f"**Compared Ratings:**\n"
             )
             for p in sorted(previous_products, key=lambda x: float(x.get("rating", 0)), reverse=True):
                 text += f"- **{p['name']}**: {p['rating']} ★ (₹{float(p['price']):,.2f})\n"
@@ -233,7 +329,7 @@ class ShoppingAssistant:
         elif metric == "price_low":
             cheapest = min(previous_products, key=lambda p: float(p.get("price", 999999)))
             text = (
-                f"💰 **Most Budget-Friendly Option:**\n\n"
+                f"💰 **Most Affordable Option:**\n\n"
                 f"**{cheapest['name']}** is the lowest-priced option at **₹{float(cheapest['price']):,.2f}** "
                 f"with a **{cheapest['rating']} ★** rating.\n\n"
                 f"- **Brand:** {cheapest['brand']}\n"
@@ -243,17 +339,6 @@ class ShoppingAssistant:
             )
             for p in sorted(previous_products, key=lambda x: float(x.get("price", 0))):
                 text += f"- **{p['name']}**: ₹{float(p['price']):,.2f} ({p['rating']} ★)\n"
-
-        elif metric == "price_high":
-            premium = max(previous_products, key=lambda p: float(p.get("price", 0)))
-            text = (
-                f"💎 **Top Premium Product:**\n\n"
-                f"**{premium['name']}** is the top-tier selection at **₹{float(premium['price']):,.2f}** "
-                f"rated **{premium['rating']} ★**.\n\n"
-                f"- **Brand:** {premium['brand']}\n"
-                f"- **Details:** {premium['description']}\n"
-            )
-
         else:
             text = "🔍 **Product Comparison Overview:**\n\n"
             for i, p in enumerate(previous_products, 1):
@@ -263,18 +348,23 @@ class ShoppingAssistant:
                     f"- Highlight: {p['description']}\n\n"
                 )
 
+        response_text = text
         if self.is_llm_enabled:
-            llm_text = self._generate_llm_response(
-                user_query=routing.raw_query,
-                context_type="comparison",
-                data_summary=f"PRODUCTS TO COMPARE: {previous_products}. User focus: {metric}.",
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate AI assistant comparing products discussed in conversation.\n"
+                    "Compare them using ONLY the attributes provided below. Format prices in ₹.\n"
+                    f"PRODUCTS TO COMPARE: {previous_products}\n"
+                    f"User focus: {metric}"
+                ),
+                user_message=routing.raw_query,
             )
             if llm_text:
-                text = llm_text
+                response_text = llm_text
 
         return {
-            "response_text": text,
-            "intent": "product_comparison",
+            "response_text": response_text,
+            "intent": INTENT_PRODUCT_COMPARISON,
             "products": previous_products,
             "order": None,
             "mode": "llm" if self.is_llm_enabled else "deterministic",
@@ -285,12 +375,13 @@ class ShoppingAssistant:
         category = routing.category or self.memory.get_active_category()
         max_price = routing.max_price
 
-        # Update memory context entities
+        # Update context entities
         if max_price:
             self.memory.set_context_entity("active_budget", max_price)
         if category:
             self.memory.set_context_entity("active_category", category)
 
+        # Tool execution: search ChromaDB
         products = self.search_engine.search_products(
             query=routing.search_query or category or "affordable",
             n_results=5,
@@ -307,27 +398,30 @@ class ShoppingAssistant:
             )
             return {
                 "response_text": text,
-                "intent": "follow_up",
+                "intent": INTENT_FOLLOW_UP,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
             }
 
         price_clause = f" priced under ₹{max_price:,.2f}" if max_price else ""
-        text = f"Here are great alternative options{price_clause} based on our discussion:"
+        response_text = f"Here are great alternative options{price_clause} based on our discussion:"
 
         if self.is_llm_enabled:
-            llm_text = self._generate_llm_response(
-                user_query=routing.raw_query,
-                context_type="products",
-                data_summary=f"MATCHING PRODUCTS: {products}. Category: {category}. Max price: {max_price}.",
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate AI assistant recommending alternative products.\n"
+                    "Summarize why these alternatives are great options based on the user's criteria.\n"
+                    f"PRODUCTS: {products}\nCategory: {category}\nBudget: {max_price}"
+                ),
+                user_message=routing.raw_query,
             )
             if llm_text:
-                text = llm_text
+                response_text = llm_text
 
         return {
-            "response_text": text,
-            "intent": "follow_up",
+            "response_text": response_text,
+            "intent": INTENT_FOLLOW_UP,
             "products": products,
             "order": None,
             "mode": "llm" if self.is_llm_enabled else "deterministic",
@@ -344,6 +438,7 @@ class ShoppingAssistant:
         if category:
             self.memory.set_context_entity("active_category", category)
 
+        # Tool execution: search ChromaDB
         products = self.search_engine.search_products(
             query=routing.search_query or routing.raw_query,
             n_results=5,
@@ -364,119 +459,94 @@ class ShoppingAssistant:
             )
             return {
                 "response_text": text,
-                "intent": "product_search",
+                "intent": INTENT_PRODUCT_SEARCH,
                 "products": [],
                 "order": None,
                 "mode": "deterministic",
             }
 
         price_badge = f" under ₹{max_price:,.2f}" if max_price else ""
-        text = f"I found {len(products)} relevant products{price_badge} matching your request:"
+        response_text = f"I found {len(products)} relevant products{price_badge} matching your request:"
 
         if self.is_llm_enabled:
-            llm_text = self._generate_llm_response(
-                user_query=routing.raw_query,
-                context_type="products",
-                data_summary=f"MATCHING PRODUCTS: {products}. Max price constraint: {max_price}.",
+            llm_text = self._call_llm(
+                system_prompt=(
+                    "You are ShopMate, a professional AI shopping assistant.\n"
+                    "Summarize these product recommendations concisely and helpfully. "
+                    "Highlight prices (in ₹), ratings, and key features. "
+                    "Do NOT fabricate any specs or products not listed below.\n"
+                    f"RETRIEVED CATALOG PRODUCTS: {products}"
+                ),
+                user_message=routing.raw_query,
             )
             if llm_text:
-                text = llm_text
+                response_text = llm_text
 
         return {
-            "response_text": text,
-            "intent": "product_search",
+            "response_text": response_text,
+            "intent": INTENT_PRODUCT_SEARCH,
             "products": products,
             "order": None,
             "mode": "llm" if self.is_llm_enabled else "deterministic",
         }
 
-    def _handle_greeting_help(self, routing: IntentResult) -> Dict[str, Any]:
-        """Provide friendly onboarding and capabilities overview."""
-        text = (
-            "👋 **Welcome to ShopMate — Your AI Shopping Assistant!**\n\n"
-            "I can assist you with:\n"
-            "1. 🔍 **Semantic Product Search:** *'Find wireless headphones under ₹3000'* or *'Show laptop study accessories'*\n"
-            "2. ⚖️ **Product Comparisons:** *'Which of those has the highest rating?'* or *'Show cheaper alternatives'*\n"
-            "3. 📦 **Live Order Tracking:** *'Where is my order ORD1002?'* or *'Track order ORD1003'*\n"
-            "4. 💡 **Budget Recommendations:** Filter by price and categories accurately.\n\n"
-            "What would you like to explore today?"
-        )
-        return {
-            "response_text": text,
-            "intent": "greeting_help",
-            "products": [],
-            "order": None,
-            "mode": "deterministic",
-        }
-
-    def _generate_llm_response(
-        self,
-        user_query: str,
-        context_type: str,
-        data_summary: str,
-    ) -> Optional[str]:
-        """Invoke external Gemini or OpenAI model with strict grounding rules."""
-        if not self.is_llm_enabled:
-            return None
-
-        system_prompt = (
-            "You are a professional, helpful, and concise AI E-Commerce Shopping Assistant. "
-            "CRITICAL GROUNDING RULES:\n"
-            "1. NEVER invent products, prices, ratings, features, or order details not present in the provided context.\n"
-            "2. For order tracking, ONLY state facts confirmed by the order data. Never invent shipping locations or delivery promises.\n"
-            "3. Always format prices in Indian Rupees (₹).\n"
-            "4. Keep responses crisp, polite, and actionable for shoppers.\n"
-            f"CONTEXT DATA:\n{data_summary}"
-        )
-
-        # 1. Handle Gemini API
+    def _call_llm(self, system_prompt: str, user_message: str) -> Optional[str]:
+        """Invoke Gemini or OpenAI with error handling and fallback model recovery."""
+        # 1. Try Gemini
         if self._gemini_client is not None:
-            try:
-                from google.genai import types
+            from google.genai import types
 
-                config = types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.3,
-                    max_output_tokens=500,
-                )
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.3,
+                max_output_tokens=600,
+            )
 
-                contents = []
-                for turn in self.memory.get_conversation_history_for_prompt(max_turns=3):
-                    role = "user" if turn["role"] == "user" else "model"
-                    contents.append(
-                        types.Content(role=role, parts=[types.Part.from_text(text=turn["content"])])
-                    )
+            # Build conversational turns
+            contents = []
+            for turn in self.memory.get_conversation_history_for_prompt(max_turns=3):
+                role = "user" if turn["role"] == "user" else "model"
                 contents.append(
-                    types.Content(role="user", parts=[types.Part.from_text(text=user_query)])
+                    types.Content(role=role, parts=[types.Part.from_text(text=turn["content"])])
                 )
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+            )
 
-                response = self._gemini_client.models.generate_content(
-                    model=self.gemini_model_name,
-                    contents=contents,
-                    config=config,
-                )
-                if response and response.text:
-                    return response.text.strip()
-            except Exception as e:
-                print(f"Gemini generation failed: {e}. Falling back to deterministic response.")
-                return None
+            # Candidate model list to try
+            models_to_try = [self.gemini_model_name] + [
+                m for m in GEMINI_MODELS_PREFERENCE if m != self.gemini_model_name
+            ]
 
-        # 2. Handle OpenAI API
+            for model_candidate in models_to_try:
+                try:
+                    resp = self._gemini_client.models.generate_content(
+                        model=model_candidate,
+                        contents=contents,
+                        config=config,
+                    )
+                    if resp and resp.text:
+                        self.gemini_model_name = model_candidate
+                        return resp.text.strip()
+                except Exception as e:
+                    # Model not available or 503, try next candidate
+                    continue
+
+        # 2. Try OpenAI
         if self._openai_client is not None:
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(self.memory.get_conversation_history_for_prompt(max_turns=3))
-            messages.append({"role": "user", "content": user_query})
+            messages.append({"role": "user", "content": user_message})
 
             try:
-                response = self._openai_client.chat.completions.create(
+                resp = self._openai_client.chat.completions.create(
                     model=self.openai_model_name,
                     messages=messages,
                     temperature=0.3,
                     max_tokens=500,
                 )
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                print(f"OpenAI generation failed: {e}. Falling back to deterministic response.")
-                return None
+                return resp.choices[0].message.content.strip()
+            except Exception:
+                pass
 
         return None
