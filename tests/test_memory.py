@@ -62,3 +62,42 @@ def test_memory_clear():
     assert mem.get_active_budget() is None
     assert mem.get_context_entity("active_order_id") is None
     assert len(mem.get_last_recommended_products()) == 0
+
+
+def test_conversation_history_turns_and_exports():
+    """Verify grouping into turns, stats, and exporting to JSON and Markdown."""
+    mem = ConversationMemory()
+    mem.add_user_message("Show me headphones")
+    mem.add_assistant_message(
+        "Here are recommendations:",
+        products=[{"name": "boAt Rockerz 450", "price": 1499, "category": "audio", "brand": "boAt"}],
+        metadata={"intent": "product_search"},
+    )
+    mem.add_user_message("Where is my order ORD1002?")
+    mem.add_assistant_message(
+        "Your order is in transit.",
+        order={"order_id": "ORD1002", "order_status": "Shipped", "expected_delivery_date": "2024-03-26"},
+        metadata={"intent": "order_tracking"},
+    )
+
+    turns = mem.get_history_turns()
+    assert len(turns) == 2
+    assert turns[0]["user_query"] == "Show me headphones"
+    assert turns[0]["intent"] == "product_search"
+    assert len(turns[0]["products"]) == 1
+    assert turns[1]["order"]["order_id"] == "ORD1002"
+
+    stats = mem.get_session_stats()
+    assert stats["total_turns"] == 2
+    assert stats["products_recommended_count"] == 1
+    assert "ORD1002" in stats["orders_tracked"]
+
+    json_export = mem.export_as_json()
+    assert "boAt Rockerz 450" in json_export
+    assert "ORD1002" in json_export
+
+    md_export = mem.export_as_markdown()
+    assert "# 🛍️ ShopMate Shopping Assistant" in md_export
+    assert "boAt Rockerz 450" in md_export
+    assert "ORD1002" in md_export
+

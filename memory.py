@@ -2,10 +2,12 @@
 
 Manages message history, turn windowing, active entities (budget, category, products, orders),
 and integrates with Streamlit session_state while remaining fully usable in headless unit tests.
+Provides complete conversation history tracking, session export (JSON & Markdown), and analytics.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import Any, Dict, List, Optional
 
 
@@ -18,11 +20,30 @@ class ChatMessage:
     order: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def formatted_time(self) -> str:
+        """Return clean human-readable timestamp (e.g. '10:45 AM' or 'Oct 12, 10:45 AM')."""
+        try:
+            dt = datetime.fromisoformat(self.timestamp)
+            return dt.strftime("%I:%M %p")
+        except Exception:
+            return self.timestamp[:16] if self.timestamp else ""
+
+    @property
+    def formatted_date_time(self) -> str:
+        """Return full formatted date and time (e.g. 'Oct 12, 2026 • 10:45 AM')."""
+        try:
+            dt = datetime.fromisoformat(self.timestamp)
+            return dt.strftime("%b %d, %Y • %I:%M %p")
+        except Exception:
+            return self.timestamp or ""
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "role": self.role,
             "content": self.content,
             "timestamp": self.timestamp,
+            "formatted_time": self.formatted_time,
             "products": self.products,
             "order": self.order,
             "metadata": self.metadata,
@@ -30,7 +51,7 @@ class ChatMessage:
 
 
 class ConversationMemory:
-    """Session-level conversation memory with entity tracking and turn windowing."""
+    """Session-level conversation memory with entity tracking, turn windowing, and history export."""
 
     def __init__(self, max_turns: int = 10, session_state: Optional[Any] = None):
         """Initialize memory.
@@ -157,6 +178,141 @@ class ConversationMemory:
     def get_active_category(self) -> Optional[str]:
         """Retrieve active product category."""
         return self.get_context_entity("active_category")
+
+    def get_history_turns(self) -> List[Dict[str, Any]]:
+        """Group chronological messages into paired turns for history exploration."""
+        turns: List[Dict[str, Any]] = []
+        msgs = self.messages
+        current_turn: Optional[Dict[str, Any]] = None
+
+        for msg in msgs:
+            if msg.role == "user":
+                if current_turn is not None:
+                    turns.append(current_turn)
+                current_turn = {
+                    "turn_index": len(turns) + 1,
+                    "user_query": msg.content,
+                    "user_time": msg.formatted_time,
+                    "user_full_time": msg.formatted_date_time,
+                    "assistant_response": "",
+                    "assistant_time": "",
+                    "intent": "general",
+                    "products": [],
+                    "order": None,
+                }
+            elif msg.role == "assistant":
+                if current_turn is None:
+                    current_turn = {
+                        "turn_index": len(turns) + 1,
+                        "user_query": "Initial Conversation",
+                        "user_time": msg.formatted_time,
+                        "user_full_time": msg.formatted_date_time,
+                        "assistant_response": msg.content,
+                        "assistant_time": msg.formatted_time,
+                        "intent": msg.metadata.get("intent", "general"),
+                        "products": msg.products or [],
+                        "order": msg.order,
+                    }
+                else:
+                    current_turn["assistant_response"] = msg.content
+                    current_turn["assistant_time"] = msg.formatted_time
+                    current_turn["intent"] = msg.metadata.get("intent", "general")
+                    current_turn["products"] = msg.products or []
+                    current_turn["order"] = msg.order
+                turns.append(current_turn)
+                current_turn = None
+
+        if current_turn is not None:
+            turns.append(current_turn)
+
+        return turns
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Calculate shopping session analytics."""
+        msgs = self.messages
+        user_msgs = [m for m in msgs if m.role == "user"]
+        assistant_msgs = [m for m in msgs if m.role == "assistant"]
+
+        all_products: List[Dict[str, Any]] = []
+        orders_tracked: List[str] = []
+        categories_seen = set()
+
+        for m in assistant_msgs:
+            if m.products:
+                for p in m.products:
+                    all_products.append(p)
+                    if "category" in p:
+                        categories_seen.add(p["category"])
+            if m.order and "order_id" in m.order:
+                orders_tracked.append(m.order["order_id"])
+
+        return {
+            "total_messages": len(msgs),
+            "total_turns": len(user_msgs),
+            "products_recommended_count": len(all_products),
+            "unique_categories": sorted(list(categories_seen)),
+            "orders_tracked": sorted(list(set(orders_tracked))),
+            "active_budget": self.get_active_budget(),
+            "active_category": self.get_active_category(),
+        }
+
+    def export_as_json(self) -> str:
+        """Export complete conversation history as formatted JSON."""
+        data = {
+            "session_exported_at": datetime.now().isoformat(),
+            "stats": self.get_session_stats(),
+            "context": self.context,
+            "turns": self.get_history_turns(),
+            "raw_messages": [m.to_dict() for m in self.messages],
+        }
+        return json.dumps(data, indent=2)
+
+    def export_as_markdown(self) -> str:
+        """Export conversation history as an elegant markdown document."""
+        stats = self.get_session_stats()
+        lines = [
+            "# 🛍️ ShopMate Shopping Assistant — Conversation Transcript",
+            f"**Exported:** {datetime.now().strftime('%B %d, %Y at %I:%M %p')}",
+            "",
+            "## 📊 Session Summary",
+            f"- **Total Interactions:** {stats['total_turns']} turns ({stats['total_messages']} messages)",
+            f"- **Products Recommended:** {stats['products_recommended_count']}",
+            f"- **Categories Explored:** {', '.join(stats['unique_categories']) if stats['unique_categories'] else 'None'}",
+            f"- **Orders Tracked:** {', '.join(stats['orders_tracked']) if stats['orders_tracked'] else 'None'}",
+            f"- **Active Budget:** ₹{stats['active_budget']:,.2f}" if stats['active_budget'] else "- **Active Budget:** None",
+            "",
+            "---",
+            "## 💬 Conversation History",
+            "",
+        ]
+
+        turns = self.get_history_turns()
+        if not turns:
+            lines.append("*No messages recorded in this session.*")
+        else:
+            for turn in turns:
+                lines.append(f"### Turn #{turn['turn_index']} • {turn['user_time']}")
+                lines.append(f"**👤 You:** {turn['user_query']}")
+                lines.append("")
+                lines.append(f"**🛍️ ShopMate ({turn['intent'].replace('_', ' ').title()}):**")
+                lines.append(turn['assistant_response'])
+                lines.append("")
+
+                if turn.get("products"):
+                    lines.append("**Recommended Items:**")
+                    for p in turn["products"]:
+                        price = f"₹{float(p.get('price', 0)):,.2f}"
+                        lines.append(f"- **{p.get('name')}** — {price} (★ {p.get('rating', '4.0')}) | *{p.get('brand')}*")
+                    lines.append("")
+
+                if turn.get("order"):
+                    ord_data = turn["order"]
+                    lines.append(f"**Tracked Order #{ord_data.get('order_id')}:** Status: `{ord_data.get('order_status')}` | Expected: {ord_data.get('expected_delivery_date')}")
+                    lines.append("")
+
+                lines.append("---")
+
+        return "\n".join(lines)
 
     def clear(self) -> None:
         """Clear all conversation history and entity state."""
