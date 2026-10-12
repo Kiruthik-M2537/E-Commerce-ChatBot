@@ -321,6 +321,15 @@ class ProductSearchEngine:
             return sorted(self.catalog_df["category"].unique().tolist())
         return ["audio", "accessories", "electronics", "wearables", "home products", "cameras"]
 
+    def get_all_products(self) -> List[Dict[str, Any]]:
+        """Return all products in catalog as a list of dictionaries."""
+        if self.catalog_df is None or self.catalog_df.empty:
+            try:
+                self.catalog_df = self.validate_csv()
+            except Exception:
+                return []
+        return [row.to_dict() for _, row in self.catalog_df.iterrows()]
+
 
 # Module-level helper for quick search
 _global_engine: Optional[ProductSearchEngine] = None

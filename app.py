@@ -14,8 +14,11 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 import memory as memory_module
+import product_search as product_search_module
+
 try:
     importlib.reload(memory_module)
+    importlib.reload(product_search_module)
 except Exception:
     pass
 
@@ -967,8 +970,19 @@ with tab_catalog:
     st.markdown("### 🏷️ Browse Complete ShopMate Catalog")
     st.markdown("Directly explore our catalog with verified ratings, brand filters, and instant AI follow-ups.")
 
-    all_prods = search_engine.get_all_products()
-    all_categories = ["All Categories"] + sorted(list({p.get("category", "").title() for p in all_prods}))
+    if hasattr(search_engine, "get_all_products"):
+        all_prods = search_engine.get_all_products()
+    elif hasattr(search_engine, "catalog_df") and search_engine.catalog_df is not None and not search_engine.catalog_df.empty:
+        all_prods = [row.to_dict() for _, row in search_engine.catalog_df.iterrows()]
+    else:
+        try:
+            import pandas as pd
+            _csv_path = getattr(search_engine, "csv_path", os.path.join(os.path.dirname(__file__), "data", "products.csv"))
+            all_prods = pd.read_csv(_csv_path).to_dict(orient="records")
+        except Exception:
+            all_prods = []
+
+    all_categories = ["All Categories"] + sorted(list({str(p.get("category", "")).title() for p in all_prods if p.get("category")}))
 
     f_col1, f_col2, f_col3 = st.columns([2, 2, 2])
     with f_col1:

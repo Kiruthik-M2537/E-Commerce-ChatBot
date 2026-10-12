@@ -105,3 +105,12 @@ def test_empty_results_when_budget_too_low(search_engine):
         max_price=50.0,  # No accessory is under 50 rupees
     )
     assert len(results) == 0
+
+
+def test_get_all_products(search_engine):
+    """Verify that get_all_products returns the complete catalog."""
+    all_prods = search_engine.get_all_products()
+    assert len(all_prods) >= 24
+    assert any("sony" in p["name"].lower() for p in all_prods)
+    assert any(p["category"] == "audio" for p in all_prods)
+
