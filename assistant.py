@@ -31,27 +31,52 @@ class ShoppingAssistant:
         self.order_client = order_client or default_order_client
         self.router = IntentRouter()
 
-        # Optional OpenAI configuration
-        self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-        self.model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip()
+        # Optional Gemini and OpenAI configurations
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash").strip()
 
-        self._llm_client = None
-        if self.api_key:
+        self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+        self.openai_model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip()
+
+        self.engine_type = "deterministic"
+        self._gemini_client = None
+        self._openai_client = None
+
+        # Prioritize Gemini if GEMINI_API_KEY is provided
+        if self.gemini_api_key:
+            try:
+                from google import genai
+                self._gemini_client = genai.Client(api_key=self.gemini_api_key)
+                self.engine_type = "gemini"
+            except Exception as e:
+                print(f"Warning: Could not initialize Google Gemini client: {e}. Falling back to deterministic mode.")
+                self._gemini_client = None
+        elif self.openai_api_key:
             try:
                 from openai import OpenAI
-                kwargs = {"api_key": self.api_key}
-                if self.base_url:
-                    kwargs["base_url"] = self.base_url
-                self._llm_client = OpenAI(**kwargs)
+                kwargs = {"api_key": self.openai_api_key}
+                if self.openai_base_url:
+                    kwargs["base_url"] = self.openai_base_url
+                self._openai_client = OpenAI(**kwargs)
+                self.engine_type = "openai"
             except Exception as e:
                 print(f"Warning: Could not initialize OpenAI client: {e}. Falling back to deterministic mode.")
-                self._llm_client = None
+                self._openai_client = None
 
     @property
     def is_llm_enabled(self) -> bool:
-        """Return True if an external LLM is configured and ready."""
-        return self._llm_client is not None
+        """Return True if an external LLM (Gemini or OpenAI) is configured and ready."""
+        return self._gemini_client is not None or self._openai_client is not None
+
+    @property
+    def engine_name(self) -> str:
+        """User-friendly descriptor of the active AI engine."""
+        if self._gemini_client is not None:
+            return f"Google Gemini ({self.gemini_model_name})"
+        elif self._openai_client is not None:
+            return f"OpenAI ({self.openai_model_name})"
+        return "Deterministic Engine (Offline Ready)"
 
     def process_message(self, user_query: str) -> Dict[str, Any]:
         """Process incoming user message through routing, retrieval, and generation."""
@@ -390,8 +415,8 @@ class ShoppingAssistant:
         context_type: str,
         data_summary: str,
     ) -> Optional[str]:
-        """Invoke external OpenAI-compatible model with strict grounding rules."""
-        if not self._llm_client:
+        """Invoke external Gemini or OpenAI model with strict grounding rules."""
+        if not self.is_llm_enabled:
             return None
 
         system_prompt = (
@@ -404,19 +429,54 @@ class ShoppingAssistant:
             f"CONTEXT DATA:\n{data_summary}"
         )
 
-        # Retrieve recent message turns for conversational continuity
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(self.memory.get_conversation_history_for_prompt(max_turns=3))
-        messages.append({"role": "user", "content": user_query})
+        # 1. Handle Gemini API
+        if self._gemini_client is not None:
+            try:
+                from google.genai import types
 
-        try:
-            response = self._llm_client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=500,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"LLM generation failed: {e}. Falling back to deterministic response.")
-            return None
+                config = types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.3,
+                    max_output_tokens=500,
+                )
+
+                contents = []
+                for turn in self.memory.get_conversation_history_for_prompt(max_turns=3):
+                    role = "user" if turn["role"] == "user" else "model"
+                    contents.append(
+                        types.Content(role=role, parts=[types.Part.from_text(text=turn["content"])])
+                    )
+                contents.append(
+                    types.Content(role="user", parts=[types.Part.from_text(text=user_query)])
+                )
+
+                response = self._gemini_client.models.generate_content(
+                    model=self.gemini_model_name,
+                    contents=contents,
+                    config=config,
+                )
+                if response and response.text:
+                    return response.text.strip()
+            except Exception as e:
+                print(f"Gemini generation failed: {e}. Falling back to deterministic response.")
+                return None
+
+        # 2. Handle OpenAI API
+        if self._openai_client is not None:
+            messages = [{"role": "system", "content": system_prompt}]
+            messages.extend(self.memory.get_conversation_history_for_prompt(max_turns=3))
+            messages.append({"role": "user", "content": user_query})
+
+            try:
+                response = self._openai_client.chat.completions.create(
+                    model=self.openai_model_name,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"OpenAI generation failed: {e}. Falling back to deterministic response.")
+                return None
+
+        return None

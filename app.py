@@ -295,9 +295,9 @@ with st.sidebar:
 
     # LLM Mode Status
     if assistant.is_llm_enabled:
-        st.markdown(f"**AI Engine:** `OpenAI ({assistant.model_name})`")
+        st.markdown(f"**AI Engine:** `{assistant.engine_name}`")
     else:
-        st.markdown("**AI Engine:** `Deterministic Engine (Offline Ready)`")
+        st.markdown(f"**AI Engine:** `{assistant.engine_name}`")
         st.caption("Running in zero-cost offline mode without API keys required.")
 
     st.markdown("---")

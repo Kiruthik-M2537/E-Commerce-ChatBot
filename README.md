@@ -150,12 +150,16 @@ Edit `.env` (optional):
 ```env
 ORDER_API_URL=http://127.0.0.1:8000
 
-# Optional: To enable OpenAI completions, supply your API key:
+# Google Gemini API (Recommended - get key from https://aistudio.google.com/)
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL_NAME=gemini-2.5-flash
+
+# Optional Alternative: OpenAI
 OPENAI_API_KEY=
 OPENAI_MODEL_NAME=gpt-4o-mini
 OPENAI_BASE_URL=
 ```
-> **Note:** An API key is strictly optional! If `OPENAI_API_KEY` is not provided, ShopMate automatically runs in its deterministic offline mode with zero cost.
+> **Note:** An API key is strictly optional! If neither `GEMINI_API_KEY` nor `OPENAI_API_KEY` is provided, ShopMate automatically runs in its deterministic offline mode with zero cost. When `GEMINI_API_KEY` is provided, ShopMate utilizes Google's official `google-genai` SDK.
 
 ---
 
